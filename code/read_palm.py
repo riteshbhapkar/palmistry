@@ -1,5 +1,6 @@
 import os
 import argparse
+from PIL import Image
 from tools import *
 from model import *
 from rectification import *
@@ -42,11 +43,8 @@ def main(input):
         # 3. Line classification
         lines = classify(path_to_palmline_image)
 
-        # 4. Length measurement
-        im, contents = measure(path_to_warped_image_mini, lines)
-
-        # 5. Save result
-        save_result(im, contents, resize_value, path_to_result)
+        # 4. Save result with green lines on original image
+        save_result_green_lines_on_original(path_to_input_image, path_to_warped_image, lines, resize_value, path_to_result)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
