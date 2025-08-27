@@ -1,5 +1,5 @@
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 import matplotlib.pyplot as plt
 import cv2
 from pillow_heif import register_heif_opener
@@ -91,53 +91,140 @@ def save_result_green_lines_only(im, lines, resize_value, path_to_result):
     # Save the image without any text analysis
     im_copy.save(path_to_result)
 
+def smooth_polyline_chaikin(points, iterations=6):
+    """Lightly smooth a polyline using Chaikin's corner cutting while preserving endpoints."""
+    if not points or len(points) < 3 or iterations <= 0:
+        return points
+    smoothed = points
+    for _ in range(iterations):
+        new_points = [smoothed[0]]  # preserve first endpoint
+        for i in range(len(smoothed) - 1):
+            x0, y0 = smoothed[i]
+            x1, y1 = smoothed[i + 1]
+            qx = 0.75 * x0 + 0.25 * x1
+            qy = 0.75 * y0 + 0.25 * y1
+            rx = 0.25 * x0 + 0.75 * x1
+            ry = 0.25 * y0 + 0.75 * y1
+            new_points.append((int(qx), int(qy)))
+            new_points.append((int(rx), int(ry)))
+        new_points.append(smoothed[-1])  # preserve last endpoint
+        smoothed = new_points
+    return smoothed
+
+def generate_quadratic_bezier(p0, p1, p2, num_points):
+    """Generate points along a quadratic Bezier curve defined by p0 (start), p1 (control), p2 (end)."""
+    points = []
+    for i in range(num_points + 1):
+        t = i / num_points
+        one_minus = 1.0 - t
+        x = one_minus * one_minus * p0[0] + 2 * one_minus * t * p1[0] + t * t * p2[0]
+        y = one_minus * one_minus * p0[1] + 2 * one_minus * t * p1[1] + t * t * p2[1]
+        points.append((int(x), int(y)))
+    return points
+
+def generate_cubic_bezier(p0, c1, c2, p3, num_points):
+    """Generate points along a cubic Bezier curve defined by p0, c1, c2, p3."""
+    pts = []
+    for i in range(num_points + 1):
+        t = i / num_points
+        u = 1.0 - t
+        x = (u**3)*p0[0] + 3*(u**2)*t*c1[0] + 3*u*(t**2)*c2[0] + (t**3)*p3[0]
+        y = (u**3)*p0[1] + 3*(u**2)*t*c1[1] + 3*u*(t**2)*c2[1] + (t**3)*p3[1]
+        pts.append((int(x), int(y)))
+    return pts
+
+def _unit(vec):
+    x, y = vec
+    norm = (x*x + y*y) ** 0.5
+    if norm == 0:
+        return (0.0, 0.0)
+    return (x / norm, y / norm)
+
+def _top_point_and_tangent(line_points):
+    """Return top-most point (min y) and a tangent vector at that point (toward interior)."""
+    if not line_points:
+        return None, (0.0, 1.0)
+    # find index of min y
+    idx = min(range(len(line_points)), key=lambda i: line_points[i][1])
+    p_top = line_points[idx]
+    # pick neighbor toward interior (larger y)
+    if idx == 0:
+        neighbor = line_points[1]
+    elif idx == len(line_points) - 1:
+        neighbor = line_points[-2]
+    else:
+        left = line_points[idx - 1]
+        right = line_points[idx + 1]
+        neighbor = left if left[1] > right[1] else right
+    tangent = (neighbor[0] - p_top[0], neighbor[1] - p_top[1])
+    return p_top, _unit(tangent)
+
 def join_lines_at_top(lines, homography_matrix, original_shape, warped_shape, resize_value):
-    """Join the palm lines at the top to create an M shape"""
+    """Join the palm lines at the top to create an M shape and smooth all segments."""
     if lines is None or len(lines) < 3:
         return []
     
-    # Transform all lines to original coordinates
+    # Transform and smooth original lines
     transformed_lines = []
     for line in lines:
         if line is not None:
             transformed_line = transform_line_to_original_improved(line, homography_matrix, original_shape, warped_shape, resize_value)
             if transformed_line and len(transformed_line) > 1:
-                transformed_lines.append(transformed_line)
+                smoothed_line = smooth_polyline_chaikin(transformed_line, iterations=6)
+                transformed_lines.append(smoothed_line)
     
     if len(transformed_lines) < 3:
         return transformed_lines
     
-    # Find the top endpoints (lowest y coordinates - closest to fingers)
-    top_endpoints = []
-    for line in transformed_lines:
-        # Find the point with minimum y coordinate (top of image)
-        top_point = min(line, key=lambda p: p[1])
-        top_endpoints.append(top_point)
+    # Find top endpoints and their y-coordinates (closest to fingers = lowest y)
+    top_info = []
+    for line_pts in transformed_lines:
+        p_top, tan = _top_point_and_tangent(line_pts)
+        top_info.append((p_top, tan, p_top[1]))  # include y-coordinate for comparison
     
-    # Sort endpoints by x coordinate (left to right)
-    top_endpoints.sort(key=lambda p: p[0])
+    # Find the line with the highest top endpoint (closest to fingers = lowest y value)
+    # This is the line that extends furthest toward the fingers
+    highest_line_idx = min(range(len(top_info)), key=lambda i: top_info[i][2])
+    highest_line_top = top_info[highest_line_idx][0]
+    highest_line_tan = top_info[highest_line_idx][1]
     
-    # Create connecting lines between adjacent endpoints
+    # Connect other lines to the highest line's top endpoint
     connecting_lines = []
-    for i in range(len(top_endpoints) - 1):
-        start_point = top_endpoints[i]
-        end_point = top_endpoints[i + 1]
-        
-        # Create a simple straight line between endpoints
-        # Add some intermediate points for smoother connection
-        num_points = max(5, int(np.sqrt((end_point[0] - start_point[0])**2 + (end_point[1] - start_point[1])**2) / 10))
-        connecting_line = []
-        
-        for j in range(num_points + 1):
-            t = j / num_points
-            x = int(start_point[0] + t * (end_point[0] - start_point[0]))
-            y = int(start_point[1] + t * (end_point[1] - start_point[1]))
-            connecting_line.append((x, y))
-        
-        connecting_lines.append(connecting_line)
+    for i in range(len(top_info)):
+        if i != highest_line_idx:  # Skip the highest line itself
+            p0, t0, y0 = top_info[i]
+            
+            # Connect this line to the highest line's top endpoint
+            dx = highest_line_top[0] - p0[0]
+            dy = highest_line_top[1] - p0[1]
+            dist = max(1.0, (dx*dx + dy*dy) ** 0.5)
+            
+            # control handle length proportional to span
+            handle = 0.3 * dist
+            # lift upward a bit for nice arch
+            lift = 0.2 * dist
+            c1 = (int(p0[0] + t0[0]*handle), int(max(0, p0[1] + t0[1]*handle - lift)))
+            c2 = (int(highest_line_top[0] - highest_line_tan[0]*handle), int(max(0, highest_line_top[1] - highest_line_tan[1]*handle - lift)))
+            num_points = max(32, int(dist / 3))
+            bezier = generate_cubic_bezier(p0, c1, c2, highest_line_top, num_points)
+            # slight smoothing
+            bezier = smooth_polyline_chaikin(bezier, iterations=2)
+            connecting_lines.append(bezier)
     
-    # Return original lines plus connecting lines
     return transformed_lines + connecting_lines
+
+def draw_polyline_rounded(draw, points, width, color):
+    """Draw a thick polyline with rounded corners and endpoints (no overall blur)."""
+    if not points or len(points) < 2:
+        return
+    # Draw thick line segments
+    for i in range(len(points) - 1):
+        draw.line([points[i], points[i+1]], fill=color, width=width)
+    # Draw circular caps at each vertex to round corners and endpoints
+    r = max(1, width // 2)
+    for (x, y) in points:
+        bbox = [x - r, y - r, x + r, y + r]
+        draw.ellipse(bbox, fill=color)
 
 def save_result_green_lines_on_original(original_image_path, warped_image_path, lines, resize_value, path_to_result):
     """Save result with green lines drawn on the original image"""
@@ -145,41 +232,33 @@ def save_result_green_lines_on_original(original_image_path, warped_image_path, 
         print_error()
         return
     
-    # Load original and warped images
     original_img = cv2.imread(original_image_path)
     warped_img = cv2.imread(warped_image_path)
-    
     if original_img is None or warped_img is None:
         print_error()
         return
     
-    # Get homography matrix for inverse transformation
     homography_matrix = get_homography_matrix(original_image_path, warped_image_path)
     if homography_matrix is None:
         print_error()
         return
     
-    # Create PIL image from original for drawing
-    original_pil = Image.fromarray(cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(original_pil)
-    width = 20  # Increased from 3 to 8 for thicker lines
+    base = Image.fromarray(cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)).convert("RGBA")
+    width = 20
     
-    # Debug: Save warped image with lines for comparison
     debug_warped_with_lines(warped_img, lines, resize_value, 'results/debug_warped_with_lines.jpg')
-    
-    # Join lines at the top to create M shape
     all_lines = join_lines_at_top(lines, homography_matrix, original_img.shape, warped_img.shape, resize_value)
     
-    # Draw all lines (original + connecting lines)
-    for i, line in enumerate(all_lines):
+    overlay = Image.new("RGBA", base.size, (0,0,0,0))
+    draw = ImageDraw.Draw(overlay)
+    green = (0, 255, 0, 255)
+    for line in all_lines:
         if line and len(line) > 1:
-            draw.line(line, fill="green", width=width)
-            # Debug: print some coordinate info
-            if i < len(lines):  # Only print for original lines, not connecting lines
-                print(f"Line {i}: {len(line)} points, first: {line[0]}, last: {line[-1]}")
+            draw_polyline_rounded(draw, line, width=width, color=green)
     
-    # Save the result
-    original_pil.save(path_to_result)
+    # Remove global blur to avoid softening entire lines; corners are rounded by caps
+    result = Image.alpha_composite(base, overlay)
+    result.convert("RGB").save(path_to_result)
 
 def debug_warped_with_lines(warped_img, lines, resize_value, debug_path):
     """Debug function to save warped image with lines drawn on it"""
